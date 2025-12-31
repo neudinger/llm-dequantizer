@@ -1,0 +1,4 @@
+*.safetensors
+zig-out/
+*cache
+zls/
