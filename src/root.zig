@@ -13,13 +13,20 @@ fn pinToCpu(cpu_id: usize) !void {
 
         if (byte_index < mask_bytes.len) {
             mask_bytes[byte_index] |= @as(u8, 1) << bit_offset;
-            // sched_setaffinity returns !void (an error union), so we discard the result with `_ =`
-            // or you can `catch` it if you want to log failure.
             _ = std.os.linux.sched_setaffinity(0, &mask) catch {
                 std.debug.print("Can not pin thread cpu continue with non pined core", .{});
             };
         }
     }
+}
+
+fn generateInterleaveMask() [32]i32 {
+    var mask: [32]i32 = undefined;
+    for (0..16) |idx| {
+        mask[2 * idx] = @as(i32, @intCast(idx));
+        mask[2 * idx + 1] = ~@as(i32, @intCast(idx));
+    }
+    return mask;
 }
 
 // https://huggingface.co/docs/optimum/concept_guides/quantization
@@ -35,22 +42,16 @@ fn dequantizeBlock(
 
     const RawVec = @Vector(16, u8);
 
-    // 1. Load 16 bytes (128 bits)
-    const packed_vec: RawVec = inputs: {
-        var tmp: [16]u8 = undefined;
-        @memcpy(&tmp, block_bytes[0..16]);
-        break :inputs tmp;
-    };
+    // Load 16 bytes
+    const packed_vec: RawVec = @as(*const [16]u8, @ptrCast(block_bytes.ptr)).*;
+    // const packed_vec: RawVec = std.mem.bytesAsValue([16]u8, block_bytes[0..16]).*;
 
-    // 2. Unpack nibbles
     const low_nibbles = packed_vec & @as(RawVec, @splat(0x0F));
     const high_nibbles = (packed_vec >> @as(RawVec, @splat(4))) & @as(RawVec, @splat(0x0F));
 
-    // 3. Interleave using Negative Indices for the second vector
     const mask_indices = comptime generateInterleaveMask();
     const unpacked_u8: @Vector(32, u8) = @shuffle(u8, low_nibbles, high_nibbles, mask_indices);
 
-    // Lookup Table (Gather)
     const lut_vals = [16]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 };
     const lut_vec: @Vector(16, f32) = lut_vals;
 
@@ -65,21 +66,11 @@ fn dequantizeBlock(
         }
     }
 
-    // 5. Apply Scale
     const scale_vec: @Vector(32, f32) = @splat(scale);
     const final_vec = result_vec * scale_vec;
 
     const target_ptr: *[32]f32 = @ptrCast(target.ptr);
     target_ptr.* = final_vec;
-}
-
-fn generateInterleaveMask() [32]i32 {
-    var mask: [32]i32 = undefined;
-    for (0..16) |idx| {
-        mask[2 * idx] = @as(i32, @intCast(idx));
-        mask[2 * idx + 1] = ~@as(i32, @intCast(idx));
-    }
-    return mask;
 }
 
 fn dequantizeWorker(
@@ -93,11 +84,9 @@ fn dequantizeWorker(
     var idx: usize = 0;
     var out_idx: usize = 0;
 
-    // Iterate through the raw bytes assigned to this thread
     while (idx < raw_data_slice.len) : (idx += block_size_bytes) {
         // std.debug.print("cpu_index {}: {}\n", .{ cpu_index, idx });
 
-        // Safety check to ensure we have a full block
         if (idx + block_size_bytes > raw_data_slice.len) {
             break;
         }
@@ -114,7 +103,6 @@ fn dequantizeWorker(
 }
 
 // https://github.com/neudinger/zerauth/blob/main/lattices/lattice_zkp.cpp#L213
-// But add a few optimizations like loop tiling and explicit vectorization AND EXPLICIT prefetch
 fn matVecMul(
     output: []f32,
     input: []const f32,
@@ -127,7 +115,8 @@ fn matVecMul(
     @setRuntimeSafety(false);
     // https://github.com/neudinger/zerauth/blob/main/lattices/blake3.hpp#L318
     // https://github.com/neudinger/zerauth/blob/main/lattices/lattice_zkp.cpp#L238
-    const VecWidth = 32; // Large vector size for unrolling
+    const VecWidth = std.simd.suggestVectorLength(f32) orelse 16;
+    // std.debug.print("VecWidth: {d}\n", .{VecWidth});
     const BlockRows = 4; // Process 4 rows at a time (Tiling)
 
     var row: usize = 0;
@@ -135,13 +124,11 @@ fn matVecMul(
     // Blocked Loop: Process 4 rows per iteration
     // https: //github.com/neudinger/zerauth/blob/main/lattices/lattice_zkp.cpp#L246
     while (row + BlockRows <= rows) : (row += BlockRows) {
-        // Initialize 4 accumulators
         var sum0: @Vector(VecWidth, f32) = @splat(0.0);
         var sum1: @Vector(VecWidth, f32) = @splat(0.0);
         var sum2: @Vector(VecWidth, f32) = @splat(0.0);
         var sum3: @Vector(VecWidth, f32) = @splat(0.0);
 
-        // Calculate offsets for the 4 rows
         const off0 = (row + 0) * cols;
         const off1 = (row + 1) * cols;
         const off2 = (row + 2) * cols;
@@ -149,45 +136,34 @@ fn matVecMul(
 
         var col: usize = 0;
 
-        // Inner loop over columns
         // https: //github.com/neudinger/zerauth/blob/main/lattices/lattice_zkp.cpp#L241
         while (col + VecWidth <= cols) : (col += VecWidth) {
-            // A. Software Prefetching
-            // Look ahead ~4 cache lines (assuming 64-byte lines, 16 floats per line)
-            // 32 floats = 128 bytes = 2 cache lines. We look 4 iterations ahead.
             const prefetch_dist = VecWidth * 4;
             if (col + prefetch_dist < cols) {
-                // Prefetch weights for all 4 rows
-
                 @prefetch(&weights[off0 + col + prefetch_dist], .{ .rw = .read, .locality = 1, .cache = std.builtin.PrefetchOptions.Cache.data });
                 @prefetch(&weights[off1 + col + prefetch_dist], .{ .rw = .read, .locality = 1, .cache = std.builtin.PrefetchOptions.Cache.data });
                 @prefetch(&weights[off2 + col + prefetch_dist], .{ .rw = .read, .locality = 1, .cache = std.builtin.PrefetchOptions.Cache.data });
                 @prefetch(&weights[off3 + col + prefetch_dist], .{ .rw = .read, .locality = 1, .cache = std.builtin.PrefetchOptions.Cache.data });
             }
 
-            // B. Load Input (Reused 4 times!)
             const x_vec: @Vector(VecWidth, f32) = @as(*const [VecWidth]f32, @ptrCast(&input[col])).*;
 
-            // C. Load Weights
             const w0: @Vector(VecWidth, f32) = @as(*const [VecWidth]f32, @ptrCast(&weights[off0 + col])).*;
             const w1: @Vector(VecWidth, f32) = @as(*const [VecWidth]f32, @ptrCast(&weights[off1 + col])).*;
             const w2: @Vector(VecWidth, f32) = @as(*const [VecWidth]f32, @ptrCast(&weights[off2 + col])).*;
             const w3: @Vector(VecWidth, f32) = @as(*const [VecWidth]f32, @ptrCast(&weights[off3 + col])).*;
 
-            // D. Fused Multiply-Add
             sum0 += x_vec * w0;
             sum1 += x_vec * w1;
             sum2 += x_vec * w2;
             sum3 += x_vec * w3;
         }
 
-        // Reduction
         output[row + 0] = @reduce(.Add, sum0);
         output[row + 1] = @reduce(.Add, sum1);
         output[row + 2] = @reduce(.Add, sum2);
         output[row + 3] = @reduce(.Add, sum3);
 
-        // Scalar Tail (Handle remaining columns < 32)
         // https://github.com/neudinger/equadiffMPI/blob/main/cartesian-split/cart_main.cc#L225
         if (col < cols) {
             while (col < cols) : (col += 1) {
@@ -200,7 +176,6 @@ fn matVecMul(
         }
     }
 
-    // Handle Cleanup Rows (If total rows is not multiple of 4)
     while (row < rows) : (row += 1) {
         const row_offset = row * cols;
         var sum_vec: @Vector(VecWidth, f32) = @splat(0.0);
@@ -221,25 +196,19 @@ fn matVecMul(
 const SafeTensorsFile = struct {
     allocator: std.mem.Allocator,
     file: std.fs.File,
-    // Note: mapped_memory must be page-aligned for munmap to work correctly
     mapped_memory: []align(std.heap.pageSize()) u8,
     header_json: std.json.Parsed(std.json.Value),
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8) !SafeTensorsFile {
-        // 1. Open File
         const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
         errdefer file.close();
 
-        // 2. Get File Size
         const stat = try file.stat();
         const file_size = stat.size;
         if (file_size == 0) {
             return error.EmptyFile;
         }
 
-        // 3. Memory Map (std.posix.mmap)
-        // PROT.READ: We only need to read.
-        // MAP.PRIVATE: Changes (if any) are not written back to file (though we are read-only).
         const memory_mapping = try std.posix.mmap(
             null,
             file_size,
@@ -254,7 +223,6 @@ const SafeTensorsFile = struct {
         _ = try std.posix.madvise(memory_mapping.ptr, memory_mapping.len, std.posix.MADV.WILLNEED);
         _ = try std.posix.madvise(memory_mapping.ptr, memory_mapping.len, std.posix.MADV.HUGEPAGE);
 
-        // 4. Parse Header (Read from the mapped memory, not a copy)
         if (memory_mapping.len < 8) {
             return error.InvalidFile;
         }
@@ -286,9 +254,7 @@ const SafeTensorsFile = struct {
 
     pub fn deinit(self: *SafeTensorsFile) void {
         self.header_json.deinit();
-        // Unmap memory
         std.posix.munmap(self.mapped_memory);
-        // Close file handle
         self.file.close();
     }
 
@@ -301,7 +267,6 @@ const SafeTensorsFile = struct {
         var count: usize = 0;
 
         while (iter.next()) |entry| {
-            // Print first 10 tensors only
             if (count < 10) {
                 std.debug.print("Found tensor: {s}\n", .{entry.key_ptr.*});
             }
@@ -311,12 +276,10 @@ const SafeTensorsFile = struct {
         std.debug.print("-------------------------\n", .{});
     }
 
-    /// Parallel version of loadTensor
     pub fn loadTensorParallel(self: *const SafeTensorsFile, name: []const u8) ![]f32 {
         const root = self.header_json.value;
         const tensor_obj = root.object.get(name) orelse return error.TensorNotFound;
 
-        // 1. Calculate Offsets (Standard SafeTensors parsing)
         const offsets_json = tensor_obj.object.get("data_offsets").?;
         const start = offsets_json.array.items[0].integer;
         const end = offsets_json.array.items[1].integer;
@@ -332,21 +295,17 @@ const SafeTensorsFile = struct {
             return error.BufferOverrun;
         }
 
-        // The raw byte slice for the whole tensor
         const raw_data = self.mapped_memory[abs_start..abs_end];
 
-        // 2. Prepare Allocation
         const block_size_bytes = 20;
         const total_blocks = raw_data.len / block_size_bytes;
         const num_elements = total_blocks * 32;
 
-        // Use alignedAlloc so the resulting array is ready for AVX-512 in the MatMul step
-        // const alignment = std.mem.Alignment.@"64";
         const alignment = comptime std.mem.Alignment.fromByteUnits(4096);
         const output = try self.allocator.alignedAlloc(f32, alignment, num_elements);
         errdefer self.allocator.free(output);
 
-        // Page lock same as mlock
+        //  mlock
         const byte_len = output.len * @sizeOf(f32);
         _ = try std.posix.madvise(@ptrCast(output.ptr), byte_len, std.posix.MADV.HUGEPAGE);
 
@@ -362,18 +321,14 @@ const SafeTensorsFile = struct {
         // Spawn Threads
         // #pragma omp parallel for
         for (0..num_threads) |thread_idx| {
-            // Determine the range of blocks for this thread
-            // The last thread takes any remainders
             const end_block = if (thread_idx == num_threads - 1) total_blocks else start_block + blocks_per_thread;
 
-            // Map block indices to Byte offsets and Float output indices
             const byte_start = start_block * block_size_bytes;
             const byte_end = end_block * block_size_bytes;
 
             const out_start = start_block * 32;
             const out_end = end_block * 32;
 
-            // Create disjoint slices
             const raw_slice = raw_data[byte_start..byte_end];
             const out_slice = output[out_start..out_end];
 
@@ -395,7 +350,6 @@ const SafeTensorsFile = struct {
 };
 
 pub fn loadTensor(allocator: std.mem.Allocator, path: []const u8) !void {
-    // Initialize (Memory Map)
     var st_file = try SafeTensorsFile.init(allocator, path);
     defer st_file.deinit();
 
@@ -407,7 +361,7 @@ pub fn loadTensor(allocator: std.mem.Allocator, path: []const u8) !void {
     // const tensor_name = "transformer.h.0.attn.c_attn.weight"; // GPT
 
     const start_load = std.time.nanoTimestamp();
-    // Load Tensor (Triggers paging from disk for just this tensor's bytes)
+
     if (st_file.loadTensorParallel(tensor_name)) |weights| {
         defer allocator.free(weights);
 
@@ -415,7 +369,6 @@ pub fn loadTensor(allocator: std.mem.Allocator, path: []const u8) !void {
         const load_ms = @as(f64, @floatFromInt(end_load - start_load)) / 1_000_000.0;
         std.debug.print("Successfully dequantized tensor '{s}'. Size: {d} floats in {d:.2} ms.\n", .{ tensor_name, weights.len, load_ms });
 
-        // Hidden size 4096 logic
         const hidden_size = std.heap.pageSize();
         if (weights.len < hidden_size) {
             std.debug.print("Tensor too small for testing hidden_size=4096\n", .{});
@@ -426,7 +379,6 @@ pub fn loadTensor(allocator: std.mem.Allocator, path: []const u8) !void {
         const cols = hidden_size;
 
         // Create Dummy Input
-        // AVX-512 requires 64-byte alignment
         // const alignment = std.mem.Alignment.@"64";
         const alignment = comptime std.mem.Alignment.fromByteUnits(4096);
         const input = try allocator.alignedAlloc(f32, alignment, cols);

@@ -15,7 +15,7 @@ zvm use 0.15.2
 
 
 ```bash
-wget https://huggingface.co/openai/gpt-oss-20b/resolve/main/original/model.safetensors
+wget -O gptoss-model.safetensors https://huggingface.co/openai/gpt-oss-20b/resolve/main/original/model.safetensors
 ```
 
 Require
@@ -28,7 +28,7 @@ const tensor_name = "block.0.attn.qkv.weight";
 
 
 ```bash
-wget https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors
+wget -O tinyllama-model.safetensors https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/model.safetensors
 ```
 
 Require
@@ -41,6 +41,12 @@ const tensor_name = "model.layers.0.self_attn.q_proj.weight";
 ## Build dequantizer
 
 gpt-oss-20b ready
+
+```bash
+zig build -Doptimize=ReleaseSafe run -- ./gptoss-model.safetensors
+```
+
+OR
 
 ```bash
 zig build -Doptimize=ReleaseSafe
@@ -155,3 +161,89 @@ The code leverages Zig's unique features to remove runtime overhead.
 | **Latency Hiding** | `@prefetch` | Fetch data before it is needed. |
 | **Register Usage** | Loop Tiling (4x) | Reuse loaded data multiple times. |
 | **Zero-Overhead** | `comptime` | Pre-calculate constants at build time. |
+
+
+----
+
+## Possible improvement
+
+### 1. Kernel Fusion (On-the-Fly Dequantization)
+
+**Impact: High (2x-4x Speedup)**
+The current code performs dequantization in two distinct steps:
+
+1. **Expand:** Reads compressed `int4` from disk  Writes massive `f32` array to RAM.
+2. **Compute:** Reads massive `f32` array from RAM  Computes Matrix Multiplication.
+
+**The Optimization:**
+Merge these steps. Do not write the intermediate `f32` tensor to RAM.
+Instead, keep the weights compressed in RAM. During the Matrix Multiplication loop, load the `int4` data into a register, "unpack" it to `f32` *inside the CPU register*, and immediately multiply-accumulate with the input.
+
+* **Why:** Memory bandwidth is usually the bottleneck in LLM inference. Expanding 4-bit weights to 32-bit floats increases memory traffic by **8x**. Fusing them eliminates this traffic.
+
+### 2. Parallelized Matrix Multiplication
+
+**Impact: Massive (Linear scaling with cores)**
+The provided code parallelizes the *loading* (`loadTensorParallel`), but the actual math (`matVecMul`) runs on a **single thread** in the main function.
+
+```zig
+// Current:
+st_file.loadTensorParallel(...) // Uses 16 cores
+matVecMul(...)                  // Uses 1 core (Slow!)
+
+```
+
+**The Optimization:**
+Apply the same `std.Thread.spawn` pattern to `matVecMul`. Split the rows of the weight matrix across available cores.
+
+* **Strategy:** If you have 16 cores and 4096 rows, each core computes the dot product for 256 rows independently.
+
+### 3. VNNI / Integer Arithmetic Instructions
+
+**Impact: Medium/High (Latency Reduction)**
+The current code casts 4-bit integers to 32-bit floats (`f32`) for the math.
+
+```zig
+result_vec[idx] = lut_vec[_idx]; // Converts to f32
+sum += x * w;                    // f32 multiplication
+
+```
+
+**The Optimization:**
+Modern CPUs (Intel Cascade Lake+, AMD Zen 4+) have **VNNI** (Vector Neural Network Instructions) or **AMX** (Advanced Matrix Extensions).
+Instead of converting to float, you can perform the dot product using integers:
+
+1. Convert 4-bit weight  8-bit integer.
+2. Quantize Input vector  8-bit integer.
+3. Use `vpdpbusd` (AVX-512) to do `int8 * int8` accumulation (4x faster than float math).
+
+### 4. NUMA-Aware Compute (Data Locality)
+
+**Impact: High (On Multi-Socket Servers)**
+On high-end servers (e.g., Dual Xeon or Threadripper), RAM is physically attached to specific CPU dies (NUMA nodes).
+
+* **Current Issue:** One thread might allocate memory on Node 0, but a thread on Node 1 tries to read it. This traffic must cross the slow inter-socket link (UPI/Infinity Fabric).
+* **The Optimization:** Ensure that the thread *computing* rows  is the exact same thread (pinned to the same core) that *loaded* rows . This keeps data in the local RAM bank of that specific CPU die.
+
+### 5. Activation Fusion
+
+**Impact: Medium**
+In a real neural network, a matrix multiplication is usually followed by a non-linear activation (like ReLU, SiLU, or GeLU).
+
+* **Current:** `MatMul -> Write RAM` ... `Read RAM -> SiLU -> Write RAM`.
+* **Optimization:** Apply the SiLU function **inside the MatMul loop** (specifically, on the accumulation register) before writing the final result to RAM. This saves another round-trip of memory reads/writes.
+
+### Summary Diagram: The Optimized Pipeline
+
+Here is how the data flow changes with these optimizations:
+
+| Stage | Current Implementation | Optimized Implementation |
+| --- | --- | --- |
+| **Storage** | 4-bit (Disk) | 4-bit (Disk) |
+| **RAM** | **32-bit (Expanded 8x)** | **4-bit (Compressed)** |
+| **L1 Cache** | 32-bit Floats | 4-bit Integers |
+| **Registers** | Convert  F32 | Convert  F32 (or Int8) |
+| **ALU** | F32 Multiply-Add | Fused Multiply-Add |
+| **Output** | Write to RAM | Write to RAM |
+
+By keeping the data compressed until it hits the CPU registers (Kernel Fusion), to reduce the stress on the RAM, which is the primary limiter for LLM speed.
