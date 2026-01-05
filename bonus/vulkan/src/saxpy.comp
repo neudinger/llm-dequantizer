@@ -1,0 +1,43 @@
+#version 450
+
+#extension GL_EXT_debug_printf : enable
+
+// Thread group size (Workgroup size)
+// layout(local_size_x = 256) in;
+
+// Shared memory for parallel reduction within the workgroup
+// 256 Threads per Workgroup. 
+layout(constant_id = 0) const uint SHARED_SIZE = 256;
+shared float shared_sum[SHARED_SIZE];
+// The entire Workgroup works together to compute ONE row's dot product.
+layout(local_size_x_id = 0) in;
+
+// Binding 0: Input Buffer X
+layout(set = 0, binding = 0) buffer BufferX {
+    float x[];
+};
+
+// Binding 1: Input/Output Buffer Y
+layout(set = 0, binding = 1) buffer BufferY {
+    float y[];
+};
+
+// Push constants for 'a' and array size
+layout(push_constant) uniform PushConsts {
+    float a;
+    uint n;
+} consts;
+
+void main() {
+
+    uint i = gl_GlobalInvocationID.x;
+
+    if (i >= consts.n) {
+        return;
+    }
+    y[i] = consts.a * x[i] + y[i];
+    if (i == 0) {
+        debugPrintfEXT("SHARED_SIZE : %i\n", SHARED_SIZE);
+        debugPrintfEXT("Thread %d is running! Value: %f\n", i, float(i) * 2.5);
+    }
+}

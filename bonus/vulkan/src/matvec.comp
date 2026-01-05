@@ -1,0 +1,85 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+
+
+layout(std430, set = 0, binding = 0) buffer OutputBuffer {
+    float output_data[];
+};
+
+layout(std430, set = 0, binding = 1) buffer InputBuffer {
+    float input_data[];
+};
+
+// We alias the weights as float array. 
+// Note: We read this contiguously now!
+layout(std430, set = 0, binding = 2) buffer WeightsBuffer {
+    float weights_data[];
+};
+
+layout(push_constant) uniform Constants {
+    uint rows;
+    uint cols;
+} params;
+
+// Shared memory for parallel reduction within the workgroup
+// 256 Threads per Workgroup. 
+layout(constant_id = 1) const uint SHARED_SIZE = 256;
+shared float shared_sum[SHARED_SIZE];
+// The entire Workgroup works together to compute ONE row's dot product.
+layout(local_size_x_id = 1) in;
+
+void main() {
+    // Determine which row this Workgroup is responsible for.
+    // We iterate in case there are more rows than Workgroups.
+    uint global_idx = gl_GlobalInvocationID.x;
+    uint row_idx = gl_WorkGroupID.x;
+    uint thread_idx = gl_LocalInvocationID.x;
+    uint wg_size = gl_WorkGroupSize.x;
+    
+    // Grid-stride loop: If we have more rows than workgroups, loop to cover them.
+    for (; row_idx < params.rows; row_idx += gl_NumWorkGroups.x) {
+        
+        float partial_sum = 0.0;
+        uint row_offset = row_idx * params.cols;
+
+        // 1. COALESCED READ LOOP
+        // All threads read adjacent values: T0->Col0, T1->Col1...
+        // This is the single most important optimization for Row-Major matrices.
+        for (uint col = thread_idx; col < params.cols; col += wg_size) {
+            float x = input_data[col];
+            float w = weights_data[row_offset + col];
+            partial_sum += x * w;
+        }
+
+        // 2. PARALLEL REDUCTION
+        // We now have 256 partial sums scattered across the threads.
+        // We need to sum them up into one value.
+
+        // Optimization: Use Subgroup Ops if available (Vulkan 1.1+)
+        // This is much faster than Shared Memory barriers.
+        #ifdef GL_KHR_shader_subgroup_arithmetic
+            partial_sum = subgroupAdd(partial_sum);
+        #endif
+
+        // Store to shared memory so we can reduce across subgroups
+        // Note: Only the first thread of each subgroup needs to write
+        if (subgroupElect()) {
+            shared_sum[gl_SubgroupID] = partial_sum;
+        }
+        
+        barrier(); // Wait for all subgroups to write
+
+        // Final reduction by the first subgroup (or just Thread 0)
+        // This sums up the results from the different subgroups
+        if (thread_idx == 0) {
+            float final_sum = 0.0;
+            // Iterate over the number of subgroups (usually size / 32 or size / 64)
+            for (uint i = 0; i < gl_NumSubgroups; ++i) {
+                final_sum += shared_sum[i];
+            }
+            output_data[row_idx] = final_sum;
+        }
+        
+        barrier(); // Reset for next row iteration (if any)
+    }
+}
